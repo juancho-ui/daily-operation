@@ -1,0 +1,19 @@
+name = "dailysolutions-automation"
+main = "src/index.js"
+compatibility_date = "2024-09-23"
+account_id = "05cc24ec95747967ac6efdbac8679229"
+
+[vars]
+WORKER_NAME = "dailysolutions-automation"
+ENVIRONMENT = "production"
+
+# Baserow Table IDs (update after creating tables)
+BASEROW_LEADS_TABLE_ID = "1186838"
+BASEROW_ENRICHMENT_TABLE_ID = ""
+BASEROW_SEQUENCES_TABLE_ID = ""
+BASEROW_CAMPAIGNS_TABLE_ID = ""
+
+# Secrets (set via wrangler secret put)
+# BASEROW_API_TOKEN
+# WEBHOOK_SECRET
+# APOLLO_API_KEY
