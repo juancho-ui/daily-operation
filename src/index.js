@@ -37,11 +37,45 @@ export default {
             reporting: 'ready',
           },
           tables: {
-            lead_extractor_output: env.BASEROW_LEADS_TABLE_ID || '1186838',
-            lead_enrichment: env.BASEROW_ENRICHMENT_TABLE_ID || '',
-            email_sequences: env.BASEROW_SEQUENCES_TABLE_ID || '',
-            campaigns: env.BASEROW_CAMPAIGNS_TABLE_ID || '',
+            teachers: env.BASEROW_TEACHERS_TABLE_ID || '1207505',
+            plans: env.BASEROW_PLANS_TABLE_ID || '1207504',
+            notes: env.BASEROW_NOTES_TABLE_ID || '1207506',
+            reminders: env.BASEROW_REMINDERS_TABLE_ID || '1207507',
           },
+        }, corsHeaders);
+      }
+
+      // ── Debug: Test Baserow Connection ────────────────────────────
+      if (path === '/api/debug/baserow') {
+        const token = env.BASEROW_API_TOKEN;
+        const teachersTable = env.BASEROW_TEACHERS_TABLE_ID || '1207505';
+        
+        // Test read
+        const listResult = await baserowRequest(env, 'GET', `/api/database/rows/table/${teachersTable}/?user_field_names=true&page=1&size=5`);
+        const canRead = listResult && listResult.results;
+        
+        // Test write
+        const writeResult = await baserowRequest(env, 'POST', `/api/database/rows/table/${teachersTable}/?user_field_names=true`, {
+          'Teacher Name': 'Debug Test',
+          'Email': 'debug@test.com',
+          'Enrollment Status': 'Pending'
+        });
+        const canWrite = writeResult && !writeResult.error && writeResult.id;
+        
+        // Cleanup: delete the test row if created
+        if (canWrite) {
+          await baserowRequest(env, 'DELETE', `/api/database/rows/table/${teachersTable}/${writeResult.id}/`);
+        }
+        
+        return jsonResponse({
+          has_token: !!token,
+          token_preview: token ? token.substring(0, 8) + '...' : null,
+          teachers_table: teachersTable,
+          can_read: !!canRead,
+          read_count: canRead ? listResult.results.length : 0,
+          can_write: !!canWrite,
+          write_result: writeResult,
+          read_result: canRead ? 'OK' : listResult,
         }, corsHeaders);
       }
 
@@ -55,286 +89,27 @@ export default {
         }
 
         const results = [];
+        const errors = [];
         for (const lead of leads) {
-          const enriched = {
-            ...lead,
-            source_platform: source || 'manual',
-            discovered_at: new Date().toISOString(),
-            qualification_status: 'pending_enrichment',
+          const row = {
+            'Teacher Name': lead.name || `${lead.first_name} ${lead.last_name}`.trim(),
+            'Email': lead.email || '',
+            'Phone': lead.phone || '',
+            'Enrollment Status': 'Pending',
+            'Address': [lead.company || lead.company_name, lead.city, lead.state].filter(Boolean).join(', ') || '',
           };
-          results.push(enriched);
-        }
 
-        // Store in Baserow
-        const stored = await bulkCreateRows(env, env.BASEROW_LEADS_TABLE_ID || '1186838', results);
+          const stored = await baserowCreate(env, env.BASEROW_TEACHERS_TABLE_ID || '1207505', row);
+          if (stored && !stored.error) results.push(stored);
+          else errors.push(stored);
+        }
 
         return jsonResponse({
           received: leads.length,
-          stored: stored.length,
-          leads: stored,
+          stored: results.length,
+          leads: results,
+          errors: errors.length > 0 ? errors : undefined,
         }, corsHeaders);
-      }
-
-      // ── Clay Webhook (Enrichment Results) ────────────────────────
-      if (path === '/api/webhook/clay' && method === 'POST') {
-        const body = await request.json();
-
-        // Validate webhook secret
-        const secret = request.headers.get('X-Webhook-Secret');
-        if (env.WEBHOOK_SECRET && secret !== env.WEBHOOK_SECRET) {
-          return jsonResponse({ error: 'Invalid webhook secret' }, corsHeaders, 401);
-        }
-
-        const enrichedLead = {
-          email: body.email || '',
-          email_status: body.email_status || 'unknown',
-          phone: body.phone || '',
-          linkedin_url: body.linkedin_url || '',
-          company_name: body.company_name || '',
-          company_domain: body.company_domain || '',
-          company_industry: body.company_industry || '',
-          company_size: body.company_size || '',
-          company_revenue: body.company_revenue || '',
-          seniority: body.seniority || '',
-          technographics: body.technographics || '',
-          enrichment_source: body.enrichment_source || 'clay',
-          confidence_score: body.confidence_score || 0,
-        };
-
-        // Update lead in Baserow by prospect_name + company
-        const updated = await updateLeadByEmail(env, enrichedLead);
-
-        return jsonResponse({
-          received: true,
-          updated: updated !== null,
-          processed_at: new Date().toISOString(),
-        }, corsHeaders);
-      }
-
-      // ── Email Validation ─────────────────────────────────────────
-      if (path === '/api/leads/validate' && method === 'POST') {
-        const body = await request.json();
-        const { lead_id, email } = body;
-
-        if (!email) {
-          return jsonResponse({ error: 'email required' }, corsHeaders, 400);
-        }
-
-        // Basic validation
-        const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-        const isValid = emailRegex.test(email);
-
-        // Check for disposable domains
-        const disposableDomains = ['tempmail.com', 'throwaway.com', 'guerrillamail.com', 'mailinator.com'];
-        const domain = email.split('@')[1];
-        const isDisposable = disposableDomains.includes(domain);
-
-        const status = !isValid ? 'invalid' : isDisposable ? 'risky' : 'valid';
-
-        // Update lead in Baserow
-        if (lead_id) {
-          await updateRow(env, env.BASEROW_LEADS_TABLE_ID || '1186838', lead_id, {
-            email_status: status,
-          });
-        }
-
-        return jsonResponse({
-          email,
-          status,
-          is_valid: isValid,
-          is_disposable: isDisposable,
-        }, corsHeaders);
-      }
-
-      // ── Approval ─────────────────────────────────────────────────
-      if (path === '/api/leads/approve' && method === 'POST') {
-        const body = await request.json();
-        const { lead_id, action, notes } = body;
-
-        if (!lead_id || !action) {
-          return jsonResponse({ error: 'lead_id and action required' }, corsHeaders, 400);
-        }
-
-        if (!['approve', 'reject'].includes(action)) {
-          return jsonResponse({ error: 'action must be approve or reject' }, corsHeaders, 400);
-        }
-
-        const status = action === 'approve' ? 'approved' : 'rejected';
-        const updated = await updateRow(env, env.BASEROW_LEADS_TABLE_ID || '1186838', lead_id, {
-          qualification_status: status,
-          assignment_reason: notes || '',
-        });
-
-        return jsonResponse({
-          lead_id,
-          status,
-          updated: updated !== null,
-        }, corsHeaders);
-      }
-
-      // ── Bulk Approval ────────────────────────────────────────────
-      if (path === '/api/leads/approve-bulk' && method === 'POST') {
-        const body = await request.json();
-        const { lead_ids, action } = body;
-
-        if (!lead_ids || !Array.isArray(lead_ids) || !action) {
-          return jsonResponse({ error: 'lead_ids array and action required' }, corsHeaders, 400);
-        }
-
-        const status = action === 'approve' ? 'approved' : 'rejected';
-        const results = [];
-
-        for (const id of lead_ids) {
-          const updated = await updateRow(env, env.BASEROW_LEADS_TABLE_ID || '1186838', id, {
-            qualification_status: status,
-          });
-          results.push({ id, updated: updated !== null });
-        }
-
-        return jsonResponse({
-          processed: results.length,
-          results,
-        }, corsHeaders);
-      }
-
-      // ── Email Sequences ──────────────────────────────────────────
-      if (path === '/api/sequences' && method === 'GET') {
-        const sequences = await listRows(env, env.BASEROW_SEQUENCES_TABLE_ID);
-        return jsonResponse({ sequences }, corsHeaders);
-      }
-
-      if (path === '/api/sequences' && method === 'POST') {
-        const body = await request.json();
-        const { lead_id, campaign_id, sequence_name, steps } = body;
-
-        const sequence = {
-          lead: lead_id,
-          campaign: campaign_id || '',
-          sequence_name: sequence_name || 'default',
-          status: 'not_started',
-          current_step: 0,
-          total_steps: steps || 3,
-          opens: 0,
-          replies: 0,
-          bounces: 0,
-        };
-
-        const created = await createRow(env, env.BASEROW_SEQUENCES_TABLE_ID, sequence);
-
-        return jsonResponse({ sequence: created }, corsHeaders);
-      }
-
-      if (path === '/api/sequences/next-send' && method === 'POST') {
-        const body = await request.json();
-        const { lead_id } = body;
-
-        // Get sequences for this lead
-        const sequences = await listRows(env, env.BASEROW_SEQUENCES_TABLE_ID);
-        const leadSequence = sequences.find(s => s.lead === lead_id && s.status === 'sending');
-
-        if (!leadSequence) {
-          return jsonResponse({ error: 'No active sequence for this lead' }, corsHeaders, 404);
-        }
-
-        return jsonResponse({
-          sequence: leadSequence,
-          next_step: leadSequence.current_step + 1,
-          total_steps: leadSequence.total_steps,
-        }, corsHeaders);
-      }
-
-      // ── Campaigns ────────────────────────────────────────────────
-      if (path === '/api/campaigns' && method === 'GET') {
-        const campaigns = await listRows(env, env.BASEROW_CAMPAIGNS_TABLE_ID);
-        return jsonResponse({ campaigns }, corsHeaders);
-      }
-
-      if (path === '/api/campaigns' && method === 'POST') {
-        const body = await request.json();
-        const { name, target_audience } = body;
-
-        const campaign = {
-          campaign_name: name,
-          status: 'draft',
-          target_audience: target_audience || '',
-          total_leads: 0,
-          sent: 0,
-          opened: 0,
-          replied: 0,
-          converted: 0,
-        };
-
-        const created = await createRow(env, env.BASEROW_CAMPAIGNS_TABLE_ID, campaign);
-
-        return jsonResponse({ campaign: created }, corsHeaders);
-      }
-
-      // ── Reporting ────────────────────────────────────────────────
-      if (path === '/api/reports/pipeline' && method === 'GET') {
-        const leads = await listRows(env, env.BASEROW_LEADS_TABLE_ID || '1186838');
-
-        const report = {
-          total_leads: leads.length,
-          by_status: {
-            pending_enrichment: leads.filter(l => l.qualification_status === 'pending_enrichment').length,
-            pending_approval: leads.filter(l => l.qualification_status === 'pending_approval').length,
-            approved: leads.filter(l => l.qualification_status === 'approved').length,
-            rejected: leads.filter(l => l.qualification_status === 'rejected').length,
-          },
-          by_source: {},
-          by_email_status: {
-            valid: leads.filter(l => l.email_status === 'valid').length,
-            invalid: leads.filter(l => l.email_status === 'invalid').length,
-            risky: leads.filter(l => l.email_status === 'risky').length,
-            unknown: leads.filter(l => l.email_status === 'unknown').length,
-          },
-          generated_at: new Date().toISOString(),
-        };
-
-        // Count by source
-        for (const lead of leads) {
-          const src = lead.source_platform || 'unknown';
-          report.by_source[src] = (report.by_source[src] || 0) + 1;
-        }
-
-        return jsonResponse({ report }, corsHeaders);
-      }
-
-      if (path === '/api/reports/campaign' && method === 'GET') {
-        const urlParams = new URLSearchParams(url.search);
-        const campaignId = urlParams.get('id');
-
-        if (!campaignId) {
-          return jsonResponse({ error: 'campaign id required' }, corsHeaders, 400);
-        }
-
-        const campaigns = await listRows(env, env.BASEROW_CAMPAIGNS_TABLE_ID);
-        const campaign = campaigns.find(c => c.id === parseInt(campaignId));
-
-        if (!campaign) {
-          return jsonResponse({ error: 'Campaign not found' }, corsHeaders, 404);
-        }
-
-        const sequences = await listRows(env, env.BASEROW_SEQUENCES_TABLE_ID);
-        const campaignSequences = sequences.filter(s => s.campaign === parseInt(campaignId));
-
-        const report = {
-          campaign,
-          sequences: {
-            total: campaignSequences.length,
-            sending: campaignSequences.filter(s => s.status === 'sending').length,
-            completed: campaignSequences.filter(s => s.status === 'completed').length,
-            paused: campaignSequences.filter(s => s.status === 'paused').length,
-          },
-          metrics: {
-            total_opens: campaignSequences.reduce((sum, s) => sum + (s.opens || 0), 0),
-            total_replies: campaignSequences.reduce((sum, s) => sum + (s.replies || 0), 0),
-            total_bounces: campaignSequences.reduce((sum, s) => sum + (s.bounces || 0), 0),
-          },
-          generated_at: new Date().toISOString(),
-        };
-
-        return jsonResponse({ report }, corsHeaders);
       }
 
       // ── CSV Import ───────────────────────────────────────────────
@@ -349,40 +124,244 @@ export default {
         const results = [];
         for (const lead of leads) {
           const row = {
-            prospect_name: lead.name || `${lead.first_name} ${lead.last_name}`.trim(),
-            job_title: lead.title || lead.job_title || '',
-            employer: lead.company || lead.company_name || '',
-            city: lead.city || '',
-            state: lead.state || '',
-            source_platform: 'csv_import',
-            discovered_at: new Date().toISOString(),
-            qualification_status: 'pending_enrichment',
-            email: lead.email || '',
-            phone: lead.phone || '',
-            linkedin_url: lead.linkedin || lead.linkedin_url || '',
+            'Teacher Name': lead.name || `${lead.first_name} ${lead.last_name}`.trim(),
+            'Email': lead.email || '',
+            'Phone': lead.phone || '',
+            'Enrollment Status': 'Pending',
+            'Address': [lead.company || lead.company_name, lead.city, lead.state].filter(Boolean).join(', ') || '',
           };
-          results.push(row);
-        }
 
-        const stored = await bulkCreateRows(env, env.BASEROW_LEADS_TABLE_ID || '1186838', results);
+          const stored = await baserowCreate(env, env.BASEROW_TEACHERS_TABLE_ID || '1207505', row);
+          if (stored) results.push(stored);
+        }
 
         return jsonResponse({
           imported: leads.length,
-          stored: stored.length,
+          stored: results.length,
         }, corsHeaders);
       }
 
-      // ── Generic Webhook Receiver ─────────────────────────────────
-      if (path === '/api/webhook' && method === 'POST') {
+      // ── Clay Webhook (Enrichment Results) ────────────────────────
+      if (path === '/api/webhook/clay' && method === 'POST') {
         const body = await request.json();
-        const { trigger, data } = body;
 
-        console.log(`Webhook received: trigger=${trigger}`, JSON.stringify(data));
+        const secret = request.headers.get('X-Webhook-Secret');
+        if (env.WEBHOOK_SECRET && secret !== env.WEBHOOK_SECRET) {
+          return jsonResponse({ error: 'Invalid webhook secret' }, corsHeaders, 401);
+        }
+
+        // Find teacher by name or email
+        const teachers = await baserowList(env, env.BASEROW_TEACHERS_TABLE_ID || '1207505');
+        const match = teachers.find(t =>
+          t['Email'] === body.email ||
+          t['Teacher Name']?.toLowerCase().includes(body.prospect_name?.toLowerCase() || '')
+        );
+
+        if (match) {
+          const update = {
+            'Email': body.email || match['Email'],
+            'Phone': body.phone || match['Phone'],
+            'Address': body.company_name || match['Address'],
+            'Enrollment Status': 'Pending',
+          };
+          await baserowUpdate(env, env.BASEROW_TEACHERS_TABLE_ID || '1207505', match.id, update);
+        }
+
+        // Log enrichment note
+        await baserowCreate(env, env.BASEROW_NOTES_TABLE_ID || '1207506', {
+          'Note Title': `Enrichment: ${body.company_name || 'Unknown'}`,
+          'Note': `Source: ${body.enrichment_source || 'clay'}\nConfidence: ${body.confidence_score || 'N/A'}\nEmail: ${body.email || 'N/A'}\nPhone: ${body.phone || 'N/A'}`,
+          'Teacher': match ? match.id : null,
+        });
 
         return jsonResponse({
           received: true,
-          trigger,
+          matched: match !== null,
           processed_at: new Date().toISOString(),
+        }, corsHeaders);
+      }
+
+      // ── Email Validation ─────────────────────────────────────────
+      if (path === '/api/leads/validate' && method === 'POST') {
+        const body = await request.json();
+        const { lead_id, email } = body;
+
+        if (!email) {
+          return jsonResponse({ error: 'email required' }, corsHeaders, 400);
+        }
+
+        const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+        const isValid = emailRegex.test(email);
+        const disposableDomains = ['tempmail.com', 'throwaway.com', 'guerrillamail.com', 'mailinator.com'];
+        const domain = email.split('@')[1];
+        const isDisposable = disposableDomains.includes(domain);
+        const status = !isValid ? 'invalid' : isDisposable ? 'risky' : 'valid';
+
+        if (lead_id) {
+          await baserowUpdate(env, env.BASEROW_TEACHERS_TABLE_ID || '1207505', lead_id, {
+            'Enrollment Status': status === 'valid' ? 'Pending' : 'Not Enrolled',
+          });
+        }
+
+        return jsonResponse({ email, status, is_valid: isValid, is_disposable: isDisposable }, corsHeaders);
+      }
+
+      // ── Approval ─────────────────────────────────────────────────
+      if (path === '/api/leads/approve' && method === 'POST') {
+        const body = await request.json();
+        const { lead_id, action, notes } = body;
+
+        if (!lead_id || !action) {
+          return jsonResponse({ error: 'lead_id and action required' }, corsHeaders, 400);
+        }
+
+        const statusMap = { approve: 'Enrolled', reject: 'Not Enrolled' };
+        const status = statusMap[action] || 'Pending';
+
+        await baserowUpdate(env, env.BASEROW_TEACHERS_TABLE_ID || '1207505', lead_id, {
+          'Enrollment Status': status,
+        });
+
+        // Log approval note
+        if (notes) {
+          const teachers = await baserowList(env, env.BASEROW_TEACHERS_TABLE_ID || '1207505');
+          const teacher = teachers.find(t => t.id === lead_id);
+          await baserowCreate(env, env.BASEROW_NOTES_TABLE_ID || '1207506', {
+            'Note Title': `Approval: ${action}`,
+            'Note': notes,
+            'Teacher': lead_id,
+          });
+        }
+
+        return jsonResponse({ lead_id, status, action }, corsHeaders);
+      }
+
+      // ── Bulk Approval ────────────────────────────────────────────
+      if (path === '/api/leads/approve-bulk' && method === 'POST') {
+        const body = await request.json();
+        const { lead_ids, action } = body;
+
+        if (!lead_ids || !Array.isArray(lead_ids) || !action) {
+          return jsonResponse({ error: 'lead_ids array and action required' }, corsHeaders, 400);
+        }
+
+        const statusMap = { approve: 'Enrolled', reject: 'Not Enrolled' };
+        const status = statusMap[action] || 'Pending';
+        const results = [];
+
+        for (const id of lead_ids) {
+          await baserowUpdate(env, env.BASEROW_TEACHERS_TABLE_ID || '1207505', id, {
+            'Enrollment Status': status,
+          });
+          results.push({ id, status });
+        }
+
+        return jsonResponse({ processed: results.length, results }, corsHeaders);
+      }
+
+      // ── Get Leads (with filters) ─────────────────────────────────
+      if (path === '/api/leads' && method === 'GET') {
+        const urlParams = new URLSearchParams(url.search);
+        const status = urlParams.get('status');
+        const page = parseInt(urlParams.get('page') || '1');
+        const size = parseInt(urlParams.get('size') || '100');
+
+        let teachers = await baserowList(env, env.BASEROW_TEACHERS_TABLE_ID || '1207505', page, size);
+
+        if (status) {
+          teachers = teachers.filter(t => {
+            const s = t['Enrollment Status']?.value || t['Enrollment Status'];
+            return s === status;
+          });
+        }
+
+        return jsonResponse({
+          leads: teachers,
+          total: teachers.length,
+        }, corsHeaders);
+      }
+
+      // ── Plans (Campaigns) ────────────────────────────────────────
+      if (path === '/api/plans' && method === 'GET') {
+        const plans = await baserowList(env, env.BASEROW_PLANS_TABLE_ID || '1207504');
+        return jsonResponse({ plans }, corsHeaders);
+      }
+
+      if (path === '/api/plans' && method === 'POST') {
+        const body = await request.json();
+        const plan = await baserowCreate(env, env.BASEROW_PLANS_TABLE_ID || '1207504', {
+          'Plan Name': body.name || 'New Plan',
+          'Description': body.description || '',
+        });
+        return jsonResponse({ plan }, corsHeaders);
+      }
+
+      // ── Reminders ────────────────────────────────────────────────
+      if (path === '/api/reminders' && method === 'GET') {
+        const reminders = await baserowList(env, env.BASEROW_REMINDERS_TABLE_ID || '1207507');
+        return jsonResponse({ reminders }, corsHeaders);
+      }
+
+      if (path === '/api/reminders' && method === 'POST') {
+        const body = await request.json();
+        const reminder = await baserowCreate(env, env.BASEROW_REMINDERS_TABLE_ID || '1207507', {
+          'Reminder Title': body.title || 'Follow-up',
+          'Reminder': body.message || '',
+          'Due Date': body.due_date || new Date().toISOString().split('T')[0],
+          'Teacher': body.teacher_id || null,
+        });
+        return jsonResponse({ reminder }, corsHeaders);
+      }
+
+      // ── Notes ────────────────────────────────────────────────────
+      if (path === '/api/notes' && method === 'GET') {
+        const notes = await baserowList(env, env.BASEROW_NOTES_TABLE_ID || '1207506');
+        return jsonResponse({ notes }, corsHeaders);
+      }
+
+      if (path === '/api/notes' && method === 'POST') {
+        const body = await request.json();
+        const note = await baserowCreate(env, env.BASEROW_NOTES_TABLE_ID || '1207506', {
+          'Note Title': body.title || 'Note',
+          'Note': body.content || '',
+          'Teacher': body.teacher_id || null,
+        });
+        return jsonResponse({ note }, corsHeaders);
+      }
+
+      // ── Reporting ────────────────────────────────────────────────
+      if (path === '/api/reports/pipeline' && method === 'GET') {
+        const teachers = await baserowList(env, env.BASEROW_TEACHERS_TABLE_ID || '1207505');
+
+        const report = {
+          total_leads: teachers.length,
+          by_status: {},
+          by_department: {},
+          generated_at: new Date().toISOString(),
+        };
+
+        for (const t of teachers) {
+          const status = t['Enrollment Status']?.value || t['Enrollment Status'] || 'Unknown';
+          report.by_status[status] = (report.by_status[status] || 0) + 1;
+          const dept = t['Department']?.value || t['Department'] || 'Unknown';
+          report.by_department[dept] = (report.by_department[dept] || 0) + 1;
+        }
+
+        return jsonResponse({ report }, corsHeaders);
+      }
+
+      if (path === '/api/reports/activity' && method === 'GET') {
+        const notes = await baserowList(env, env.BASEROW_NOTES_TABLE_ID || '1207506');
+        const reminders = await baserowList(env, env.BASEROW_REMINDERS_TABLE_ID || '1207507');
+
+        return jsonResponse({
+          report: {
+            total_notes: notes.length,
+            total_reminders: reminders.length,
+            recent_notes: notes.slice(-10).reverse(),
+            upcoming_reminders: reminders.slice(0, 10),
+            generated_at: new Date().toISOString(),
+          },
         }, corsHeaders);
       }
 
@@ -396,25 +375,28 @@ export default {
   async scheduled(event, env, ctx) {
     console.log(`Cron triggered at ${event.cron}`);
 
-    const tasks = [
-      processLeadEnrichment,
-      processEmailFollowups,
-      processApprovalQueue,
-      processReporting,
-    ];
+    try {
+      // Check for upcoming reminders
+      const reminders = await baserowList(env, env.BASEROW_REMINDERS_TABLE_ID || '1207507');
+      const today = new Date().toISOString().split('T')[0];
+      const dueReminders = reminders.filter(r => r['Due Date'] <= today);
 
-    for (const task of tasks) {
-      try {
-        await task(env);
-        console.log(`Task completed: ${task.name}`);
-      } catch (err) {
-        console.error(`Task failed: ${task.name}`, err);
-      }
+      console.log(`Found ${dueReminders.length} reminders due today`);
+
+      // Check for leads needing follow-up
+      const teachers = await baserowList(env, env.BASEROW_TEACHERS_TABLE_ID || '1207505');
+      const pending = teachers.filter(t =>
+        t['Enrollment Status']?.value === 'Pending'
+      );
+
+      console.log(`Found ${pending.length} leads needing attention`);
+    } catch (err) {
+      console.error('Cron error:', err);
     }
   },
 };
 
-// ── Helpers ────────────────────────────────────────────────────────
+// ── Baserow Helpers ──────────────────────────────────────────────
 
 function jsonResponse(data, headers = {}, status = 200) {
   return new Response(JSON.stringify(data, null, 2), {
@@ -426,8 +408,14 @@ function jsonResponse(data, headers = {}, status = 200) {
 const BASEROW_API = 'https://api.baserow.io';
 
 async function baserowRequest(env, method, path, body = null) {
+  const token = env.BASEROW_API_TOKEN;
+  if (!token) {
+    console.error('BASEROW_API_TOKEN not set');
+    return { error: 'BASEROW_API_TOKEN not set' };
+  }
+
   const headers = {
-    'Authorization': `Token ${env.BASEROW_API_TOKEN}`,
+    'Authorization': `Token ${token}`,
     'Content-Type': 'application/json',
   };
 
@@ -438,99 +426,32 @@ async function baserowRequest(env, method, path, body = null) {
   if (!res.ok) {
     const err = await res.text();
     console.error(`Baserow API error: ${res.status} ${err}`);
-    return null;
+    return { error: `Baserow ${res.status}: ${err}` };
   }
-  return res.json();
+  const text = await res.text();
+  if (!text || text.trim() === '') {
+    return { success: true, empty: true };
+  }
+  return JSON.parse(text);
 }
 
-async function createRow(env, tableId, data) {
+async function baserowCreate(env, tableId, data) {
   if (!tableId) return null;
-  return baserowRequest(env, 'POST', `/api/database/rows/table/${tableId}/`, data);
+  return baserowRequest(env, 'POST', `/api/database/rows/table/${tableId}/?user_field_names=true`, data);
 }
 
-async function bulkCreateRows(env, tableId, rows) {
-  if (!tableId || !rows.length) return [];
-  const results = [];
-  // Baserow bulk limit is 200
-  for (let i = 0; i < rows.length; i += 200) {
-    const batch = rows.slice(i, i + 200);
-    const res = await baserowRequest(env, 'POST', `/api/database/rows/table/${tableId}/batch-create/`, { items: batch });
-    if (res && res.items) results.push(...res.items);
-  }
-  return results;
-}
-
-async function updateRow(env, tableId, rowId, data) {
-  if (!tableId || !rowId) return null;
-  return baserowRequest(env, 'PATCH', `/api/database/rows/table/${tableId}/${rowId}/`, data);
-}
-
-async function listRows(env, tableId, page = 1, size = 200) {
+async function baserowList(env, tableId, page = 1, size = 200) {
   if (!tableId) return [];
-  const res = await baserowRequest(env, 'GET', `/api/database/rows/table/${tableId}/?page=${page}&size=${size}`);
+  const res = await baserowRequest(env, 'GET', `/api/database/rows/table/${tableId}/?user_field_names=true&page=${page}&size=${size}`);
   return res ? res.results || [] : [];
 }
 
-async function updateLeadByEmail(env, enrichedLead) {
-  const leadsTableId = env.BASEROW_LEADS_TABLE_ID || '1186838';
-  const leads = await listRows(env, leadsTableId);
-
-  // Find lead by name + company match
-  const match = leads.find(l =>
-    l.prospect_name?.toLowerCase().includes(enrichedLead.company_name?.toLowerCase() || '') ||
-    l.employer?.toLowerCase() === enrichedLead.company_name?.toLowerCase()
-  );
-
-  if (!match) return null;
-
-  return updateRow(env, leadsTableId, match.id, {
-    email: enrichedLead.email,
-    email_status: enrichedLead.email_status,
-    phone: enrichedLead.phone,
-    linkedin_url: enrichedLead.linkedin_url,
-    qualification_status: 'pending_approval',
-  });
+async function baserowUpdate(env, tableId, rowId, data) {
+  if (!tableId || !rowId) return null;
+  return baserowRequest(env, 'PATCH', `/api/database/rows/table/${tableId}/${rowId}/?user_field_names=true`, data);
 }
 
-// ── Scheduled Tasks ────────────────────────────────────────────────
-
-async function processLeadEnrichment(env) {
-  const leads = await listRows(env, env.BASEROW_LEADS_TABLE_ID || '1186838');
-  const pending = leads.filter(l => l.qualification_status === 'pending_enrichment');
-
-  console.log(`Found ${pending.length} leads pending enrichment`);
-
-  // Trigger enrichment for each lead via Apollo/Clay
-  for (const lead of pending) {
-    // This would call Apollo enrichment API or Clay webhook
-    // For now, just log
-    console.log(`Enriching: ${lead.prospect_name} at ${lead.employer}`);
-  }
-}
-
-async function processEmailFollowups(env) {
-  const sequences = await listRows(env, env.BASEROW_SEQUENCES_TABLE_ID);
-  const active = sequences.filter(s => s.status === 'sending');
-
-  console.log(`Found ${active.length} active sequences`);
-
-  for (const seq of active) {
-    // Check if it's time to send next email
-    // This would integrate with your email provider (Apollo, Smartlead, etc.)
-    console.log(`Processing sequence ${seq.id} for lead ${seq.lead}`);
-  }
-}
-
-async function processApprovalQueue(env) {
-  const leads = await listRows(env, env.BASEROW_LEADS_TABLE_ID || '1186838');
-  const pending = leads.filter(l => l.qualification_status === 'pending_approval');
-
-  console.log(`Found ${pending.length} leads pending approval`);
-
-  // Could send notification email/Slack here
-}
-
-async function processReporting(env) {
-  console.log('Running reporting aggregation...');
-  // Could push daily stats to a dashboard or send summary email
+async function baserowDelete(env, tableId, rowId) {
+  if (!tableId || !rowId) return null;
+  return baserowRequest(env, 'DELETE', `/api/database/rows/table/${tableId}/${rowId}/`);
 }
