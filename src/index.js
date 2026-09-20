@@ -329,7 +329,90 @@ export default {
         return jsonResponse({ note }, corsHeaders);
       }
 
-      // ── Reporting ────────────────────────────────────────────────
+      // ── Cron Status ───────────────────────────────────────────
+      if (path === '/api/cron/status' && method === 'GET') {
+        const notes = await baserowList(env, env.BASEROW_NOTES_TABLE_ID || '1207506');
+        const cronRuns = notes.filter(n =>
+          (n['Note Title'] || '').startsWith('Cron Run —')
+        ).reverse();
+        const cronErrors = notes.filter(n =>
+          (n['Note Title'] || '').startsWith('Cron Error —')
+        ).reverse();
+
+        return jsonResponse({
+          last_run: cronRuns[0] ? {
+            title: cronRuns[0]['Note Title'],
+            note: cronRuns[0]['Note'],
+          } : null,
+          total_runs: cronRuns.length,
+          total_errors: cronErrors.length,
+          last_error: cronErrors[0] ? {
+            title: cronErrors[0]['Note Title'],
+            note: cronErrors[0]['Note'],
+          } : null,
+        }, corsHeaders);
+      }
+
+      // ── Manual Cron Trigger (for testing) ─────────────────────
+      if (path === '/api/cron/trigger' && method === 'POST') {
+        const secret = request.headers.get('X-Webhook-Secret');
+        if (env.WEBHOOK_SECRET && secret !== env.WEBHOOK_SECRET) {
+          return jsonResponse({ error: 'Invalid secret' }, corsHeaders, 401);
+        }
+
+        const now = new Date();
+        const today = now.toISOString().split('T')[0];
+        const log = [];
+
+        // Reminders
+        const reminders = await baserowList(env, env.BASEROW_REMINDERS_TABLE_ID || '1207507');
+        const overdue = reminders.filter(r => r['Due Date'] && r['Due Date'] < today);
+        const dueToday = reminders.filter(r => r['Due Date'] === today);
+        log.push({ task: 'reminders', overdue: overdue.length, due_today: dueToday.length });
+
+        // Leads
+        const teachers = await baserowList(env, env.BASEROW_TEACHERS_TABLE_ID || '1207505');
+        const pending = teachers.filter(t =>
+          (t['Enrollment Status']?.value || t['Enrollment Status']) === 'Pending'
+        );
+        const staleThreshold = new Date(now);
+        staleThreshold.setDate(staleThreshold.getDate() - 7);
+        const staleDate = staleThreshold.toISOString().split('T')[0];
+        const stale = pending.filter(t => t['Start Date'] && t['Start Date'] < staleDate);
+        log.push({ task: 'leads', total_pending: pending.length, stale: stale.length });
+
+        // Pipeline
+        const byStatus = {};
+        for (const t of teachers) {
+          const s = t['Enrollment Status']?.value || t['Enrollment Status'] || 'Unknown';
+          byStatus[s] = (byStatus[s] || 0) + 1;
+        }
+        log.push({ task: 'pipeline', total: teachers.length, by_status: byStatus });
+
+        // Store summary
+        const summary = [
+          `Manual Cron Run — ${today}`,
+          '',
+          `Pipeline: ${teachers.length} total`,
+          Object.entries(byStatus).map(([k, v]) => `  ${k}: ${v}`).join('\n'),
+          '',
+          `Pending: ${pending.length} (stale: ${stale.length})`,
+          `Reminders: ${overdue.length} overdue, ${dueToday.length} due today`,
+        ].join('\n');
+
+        await baserowCreate(env, env.BASEROW_NOTES_TABLE_ID || '1207506', {
+          'Note Title': `Manual Cron — ${today} ${now.toISOString().slice(11, 16)}`,
+          'Note': summary,
+        });
+
+        return jsonResponse({
+          triggered_at: now.toISOString(),
+          log,
+          summary,
+        }, corsHeaders);
+      }
+
+      // ── Reports ───────────────────────────────────────────────
       if (path === '/api/reports/pipeline' && method === 'GET') {
         const teachers = await baserowList(env, env.BASEROW_TEACHERS_TABLE_ID || '1207505');
 
@@ -373,25 +456,141 @@ export default {
   },
 
   async scheduled(event, env, ctx) {
-    console.log(`Cron triggered at ${event.cron}`);
+    const now = new Date();
+    const today = now.toISOString().split('T')[0];
+    console.log(`Cron triggered at ${now.toISOString()} (${event.cron})`);
+
+    const log = [];
 
     try {
-      // Check for upcoming reminders
+      // ── 1. Overdue Reminders ──────────────────────────────────
       const reminders = await baserowList(env, env.BASEROW_REMINDERS_TABLE_ID || '1207507');
-      const today = new Date().toISOString().split('T')[0];
-      const dueReminders = reminders.filter(r => r['Due Date'] <= today);
+      const overdue = reminders.filter(r => {
+        const due = r['Due Date'];
+        return due && due <= today && due !== today;
+      });
+      const dueToday = reminders.filter(r => r['Due Date'] === today);
 
-      console.log(`Found ${dueReminders.length} reminders due today`);
+      log.push({
+        task: 'reminders',
+        overdue: overdue.length,
+        due_today: dueToday.length,
+        items: [...overdue, ...dueToday].map(r => ({
+          id: r.id,
+          title: r['Reminder Title'],
+          due: r['Due Date'],
+          overdue: r['Due Date'] < today,
+        })),
+      });
 
-      // Check for leads needing follow-up
+      console.log(`Reminders: ${overdue.length} overdue, ${dueToday.length} due today`);
+
+      // ── 2. Stale Pending Leads ────────────────────────────────
       const teachers = await baserowList(env, env.BASEROW_TEACHERS_TABLE_ID || '1207505');
       const pending = teachers.filter(t =>
-        t['Enrollment Status']?.value === 'Pending'
+        (t['Enrollment Status']?.value || t['Enrollment Status']) === 'Pending'
       );
+      const staleThreshold = new Date(now);
+      staleThreshold.setDate(staleThreshold.getDate() - 7);
+      const staleDate = staleThreshold.toISOString().split('T')[0];
 
-      console.log(`Found ${pending.length} leads needing attention`);
+      const stale = pending.filter(t => {
+        const created = t['Start Date'];
+        return created && created < staleDate;
+      });
+
+      log.push({
+        task: 'stale_leads',
+        total_pending: pending.length,
+        stale_count: stale.length,
+        stale_threshold: staleDate,
+        items: stale.map(t => ({
+          id: t.id,
+          name: t['Teacher Name'],
+          email: t['Email'],
+          since: t['Start Date'],
+        })),
+      });
+
+      console.log(`Leads: ${pending.length} pending, ${stale.length} stale (>7 days)`);
+
+      // ── 3. Pipeline Snapshot ──────────────────────────────────
+      const byStatus = {};
+      const byDept = {};
+      for (const t of teachers) {
+        const status = t['Enrollment Status']?.value || t['Enrollment Status'] || 'Unknown';
+        byStatus[status] = (byStatus[status] || 0) + 1;
+        const dept = t['Department']?.value || t['Department'] || 'Unknown';
+        byDept[dept] = (byDept[dept] || 0) + 1;
+      }
+
+      log.push({
+        task: 'pipeline_snapshot',
+        total: teachers.length,
+        by_status: byStatus,
+        by_department: byDept,
+      });
+
+      console.log(`Pipeline: ${teachers.length} total | ${JSON.stringify(byStatus)}`);
+
+      // ── 4. Notes & Reminders Count ────────────────────────────
+      const notes = await baserowList(env, env.BASEROW_NOTES_TABLE_ID || '1207506');
+      log.push({
+        task: 'activity',
+        total_notes: notes.length,
+        total_reminders: reminders.length,
+      });
+
+      // ── 5. Store Daily Summary Note ──────────────────────────
+      const summaryParts = [
+        `Daily Summary — ${today}`,
+        '',
+        `Pipeline: ${teachers.length} total`,
+        Object.entries(byStatus).map(([k, v]) => `  ${k}: ${v}`).join('\n'),
+        '',
+        `Pending leads: ${pending.length}`,
+        stale.length > 0 ? `⚠ Stale (>7 days): ${stale.length}` : '✓ No stale leads',
+        '',
+        `Reminders: ${overdue.length} overdue, ${dueToday.length} due today`,
+      ];
+
+      if (overdue.length > 0) {
+        summaryParts.push('', 'Overdue:');
+        overdue.forEach(r => summaryParts.push(`  - ${r['Reminder Title']} (due ${r['Due Date']})`));
+      }
+
+      if (stale.length > 0) {
+        summaryParts.push('', 'Stale leads (>7 days pending):');
+        stale.forEach(t => summaryParts.push(`  - ${t['Teacher Name']} <${t['Email']}>`));
+      }
+
+      await baserowCreate(env, env.BASEROW_NOTES_TABLE_ID || '1207506', {
+        'Note Title': `Daily Summary — ${today}`,
+        'Note': summaryParts.join('\n'),
+      });
+
+      console.log('Daily summary note stored');
+
+      // ── 6. Store Cron Run Log ────────────────────────────────
+      await baserowCreate(env, env.BASEROW_NOTES_TABLE_ID || '1207506', {
+        'Note Title': `Cron Run — ${today} ${now.toISOString().slice(11, 16)}`,
+        'Note': JSON.stringify({ run_at: now.toISOString(), log }, null, 2),
+      });
+
+      console.log('Cron run logged');
+
     } catch (err) {
       console.error('Cron error:', err);
+
+      // Log error to Baserow
+      try {
+        await baserowCreate(env, env.BASEROW_NOTES_TABLE_ID || '1207506', {
+          'Note Title': `Cron Error — ${today}`,
+          'Note': `Error: ${err.message}\nStack: ${err.stack || 'N/A'}`,
+        });
+      } catch (e) {
+        console.error('Failed to log error:', e);
+      }
     }
   },
 };

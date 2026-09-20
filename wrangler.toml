@@ -16,3 +16,7 @@ BASEROW_REMINDERS_TABLE_ID = "1207507"
 # Secrets (set via wrangler secret put)
 # BASEROW_API_TOKEN
 # WEBHOOK_SECRET
+
+# Daily cron: every day at 8:00 AM UTC (4:00 AM ET)
+[triggers]
+crons = ["0 8 * * *"]
